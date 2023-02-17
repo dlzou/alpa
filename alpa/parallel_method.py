@@ -38,6 +38,7 @@ from alpa.pipeline_parallel.stage_construction import (StageOption,
                                                        UniformStageOption)
 from alpa.shard_parallel.auto_sharding import AutoShardingOption, LogicalDeviceMesh
 from alpa.shard_parallel.compile_executable import compile_shard_executable
+from alpa.shard_parallel.manual_sharding import ManualShardingOption
 
 traceback_util.register_exclusion(__file__)
 
@@ -75,10 +76,12 @@ class ShardParallel(ParallelMethod):
                  devices: Optional[Union[LogicalDeviceMesh,
                                          PhysicalDeviceMesh]] = None,
                  num_micro_batches: Optional[int] = None,
-                 auto_sharding_option: Optional[AutoShardingOption] = None):
+                 auto_sharding_option: Optional[AutoShardingOption] = None,
+                 manual_sharding_option: Optional[ManualShardingOption] = None):
         self.devices = devices
         self.num_micro_batches = num_micro_batches
         self.as_option = auto_sharding_option or AutoShardingOption()
+        self.ms_option = manual_sharding_option
 
     def compile_executable(
         self,
@@ -106,7 +109,7 @@ class ShardParallel(ParallelMethod):
                                         static_argnums, donated_invars,
                                         batch_invars, mesh,
                                         self.num_micro_batches, self.as_option,
-                                        *avals)
+                                        self.ms_option, *avals)
 
 
 class DataParallel(ShardParallel):
@@ -179,15 +182,16 @@ class PipeshardParallel(ParallelMethod):
     """
 
     def __init__(
-        self,
-        devices: Optional[VirtualPhysicalMesh] = None,
-        num_micro_batches: int = 1,
-        default_auto_sharding_option: Optional[AutoShardingOption] = None,
-        pipeline_schedule: str = "1f1b",
-        layer_option: Optional[Union[LayerOption, str]] = None,
-        stage_option: Optional[Union[StageOption, str]] = None,
-        stage_input_shardings: Optional[Sequence[Sequence[
-            pxla.ShardingSpec]]] = None):
+            self,
+            devices: Optional[VirtualPhysicalMesh] = None,
+            num_micro_batches: int = 1,
+            default_auto_sharding_option: Optional[AutoShardingOption] = None,
+            pipeline_schedule: str = "1f1b",
+            layer_option: Optional[Union[LayerOption, str]] = None,
+            stage_option: Optional[Union[StageOption, str]] = None,
+            stage_input_shardings: Optional[Sequence[Sequence[
+                pxla.ShardingSpec]]] = None,
+            manual_sharding_option: ManualShardingOption = None):
         self.devices = devices
         self.num_micro_batches = num_micro_batches
         self.as_option = (default_auto_sharding_option or
@@ -209,6 +213,9 @@ class PipeshardParallel(ParallelMethod):
             stage_option = UniformStageOption()
         self.stage_option = stage_option or UniformStageOption()
         self.stage_input_shardings = stage_input_shardings
+        assert not (stage_input_shardings is not None and
+                    manual_sharding_option is not None)
+        self.manual_sharding_option = manual_sharding_option
 
     def compile_executable(
         self,
@@ -234,14 +241,16 @@ class PipeshardParallel(ParallelMethod):
             fun, in_tree, out_tree_thunk, static_argnums, donated_invars,
             batch_invars, mesh, self.num_micro_batches, self.pipeline_schedule,
             self.as_option, self.layer_option, self.stage_option, None,
-            self.stage_input_shardings, *avals)
+            self.stage_input_shardings, self.manual_sharding_option, *avals)
 
 
 def get_3d_parallel_method(num_micro_batches: int,
                            data_parallel: int,
                            operator_parallel: int,
                            pipeline_parallel: int,
-                           allow_degenerate_into_shard_parallel: bool = True):
+                           allow_degenerate_into_shard_parallel: bool = True,
+                           manual_layer_num: int = None,
+                           manual_sharding_option: ManualShardingOption = None):
     """
     Get a parallel method for 3D parallelism, which reguarlly combines
     data parallelism, operator parallelism and pipeline parallelism.
@@ -280,20 +289,29 @@ def get_3d_parallel_method(num_micro_batches: int,
                                      [data_parallel, operator_parallel]))
 
     # Return pipeshard parallel
-    layer_option = AutoLayerOption(layer_num=pp, eps=0.1)
+    if manual_layer_num is not None:
+        assert manual_layer_num % pp == 0
+        layer_option = ManualLayerOption()
+        stage_option = UniformStageOption(pp, physical_mesh_shape,
+                                          logical_mesh_shape, {})
+    else:
+        layer_option = AutoLayerOption(layer_num=pp, eps=0.1)
+        stage_option = ManualStageOption(
+            forward_stage_layer_ids=[[i] for i in range(pp)],
+            submesh_physical_shapes=[physical_mesh_shape] * pp,
+            submesh_logical_shapes=[logical_mesh_shape] * pp,
+            submesh_autosharding_option_dicts=[{}] * pp)
     return PipeshardParallel(
         devices=virtual_mesh,
         num_micro_batches=num_micro_batches,
         default_auto_sharding_option=AutoShardingOption(
+            enable_auto_sharding=manual_sharding_option is None,
             prefer_reduce_scatter=True,
             force_batch_dim_to_mesh_dim=0,
         ),
         layer_option=layer_option,
-        stage_option=ManualStageOption(
-            forward_stage_layer_ids=[[i] for i in range(pp)],
-            submesh_physical_shapes=[physical_mesh_shape] * pp,
-            submesh_logical_shapes=[logical_mesh_shape] * pp,
-            submesh_autosharding_option_dicts=[{}] * pp))
+        stage_option=stage_option,
+        manual_sharding_option=manual_sharding_option)
 
 
 class LocalPipelineParallel(ParallelMethod):

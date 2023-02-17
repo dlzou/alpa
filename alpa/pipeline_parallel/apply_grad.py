@@ -14,8 +14,9 @@ import numpy as np
 from alpa.pipeline_parallel.computation import JaxPipelineComputation
 from alpa.pipeline_parallel.primitive_def import (pipeline_p,
                                                   mark_pipeline_jaxpreqn)
-from alpa.util import (clone_jaxpr, clone_jaxpr_eqn, slices_to_jaxpr,
-                       OrderedSet, get_var_mapping, new_jaxpr_eqn)
+from alpa.util import (OrderedSet, clone_jaxpr, clone_jaxpr_eqn,
+                       get_var_mapping, mesh_ids_hash, new_jaxpr_eqn,
+                       slices_to_jaxpr)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -34,16 +35,14 @@ def _filter_droped(vars):
 
 
 def _pipeline_marker_analysis(compute_eqns):
-    """Get vars as inputs of layers and outputs"""
+    """Get vars as inputs and outputs of layers"""
     layer_invars = set()
     pipeline_outvars = {}
     marker_cnt = 0
     for eqn in compute_eqns:
         if eqn.primitive is pipeline_p:
             if eqn.params['mark_type'] == 'end':
-                for v in eqn.outvars:
-                    if isinstance(v, DropVar):
-                        continue
+                for v in _filter_droped(eqn.outvars):
                     pipeline_outvars[v] = marker_cnt
                 marker_cnt += 1
             elif eqn.params['mark_type'] == 'start':
@@ -163,9 +162,9 @@ def _get_delayed_eqns(compute_eqns, layer_invars, pipeline_outvars, gensym_fn):
             # boundary, which is harder to analyze.
             if len(outvars) == 0 and out_marker:
                 continue
-            # only if an eqn is not used and OUT MARKER does it moved after
-            # microbatch boundary. Those inside a microbatch boundary is handled
-            # by later DCE.
+            # only if an eqn is not used and is out marker will be it moved
+            # after microbatch boundary. Those inside a microbatch boundary is
+            # handled by later DCE.
             elif not used_outvars and out_marker:
                 cross_layer_grad_eqns.append(eqn)
                 continue
@@ -212,25 +211,22 @@ def _rewrite_microbatch_bound(microbatch_bound, delayed_eqns, gensym_fn):
     for invar, outvar in zip(microbatch_bound.invars, microbatch_bound.outvars):
         if isinstance(invar, Var) and not isinstance(outvar, DropVar):
             microbatch_bound_in_to_outs[invar] = outvar
-    new_cross_microbatch_bound_invars = OrderedSet()
-    new_post_microbatch_bound_outvars = OrderedSet()
+    delayed_invars = OrderedSet()
+    delayed_outvars = OrderedSet()
     for eqn in delayed_eqns:
-        for invar in eqn.invars:
-            if (isinstance(invar, Var) and
-                    invar not in microbatch_bound_in_to_outs):
-                new_cross_microbatch_bound_invars.add(invar)
-                microbatch_bound_in_to_outs[invar] = gensym_fn(invar.aval)
-        new_post_microbatch_bound_outvars.update([
-            var for var in eqn.outvars if not isinstance(var, DropVar) and
-            var in microbatch_bound_in_to_outs
-        ])
+        delayed_invars.update(_filter_literal(eqn.invars))
+        delayed_outvars.update(_filter_droped(eqn.outvars))
+    delayed_invars.difference_update(delayed_outvars)
+    delayed_invars.difference_update(microbatch_bound_in_to_outs.keys())
+    delayed_outvars.intersection_update(microbatch_bound_in_to_outs.keys())
+    for invar in delayed_invars:
+        microbatch_bound_in_to_outs[invar] = gensym_fn(invar.aval)
     # rewrite the microbatch_bound
     new_microbatch_bound_invars = []
     new_microbatch_bound_outvars = []
-    for idx, var in enumerate(microbatch_bound.invars +
-                              list(new_cross_microbatch_bound_invars)):
+    for idx, var in enumerate(microbatch_bound.invars + list(delayed_invars)):
         # remove vars now defined after microbatch_bound.
-        if isinstance(var, Var) and var in new_post_microbatch_bound_outvars:
+        if isinstance(var, Var) and var in delayed_outvars:
             continue
         new_microbatch_bound_invars.append(var)
         # add vars now used after microbatch_bound.
@@ -303,9 +299,47 @@ def _rewrite_cross_layer_grad(compute_eqns, microbatch_bound, apply_eqns,
                                eqns=new_compute_eqns + [new_microbatch_bound] +
                                new_apply_eqns,
                                outvars=new_global_outvars)
-    return closed_jaxpr, [
-        new_compute_eqns, [new_microbatch_bound], new_apply_eqns
+    return closed_jaxpr
+
+
+def _remove_replicated_marked_var(closed_jaxpr: ClosedJaxpr):
+    """Some variables are marked multiple times with the same marker.
+    This pass removes them.
+    """
+    new_eqns = []
+    var_map = {}
+    mb_idx = None
+    for eqn in closed_jaxpr.eqns:
+        if eqn.primitive == pipeline_p:
+            eqn_map = {}
+            new_invars = []
+            new_outvars = []
+            if eqn.params['mark_type'] == 'grad':
+                mb_idx = len(new_eqns)
+            for inv, outv in zip(eqn.invars, eqn.outvars):
+                if isinstance(outv, DropVar):
+                    continue
+                if isinstance(inv, Var):
+                    if inv in var_map:
+                        var_map[outv] = var_map[inv]
+                        continue
+                    elif inv in eqn_map:
+                        var_map[outv] = eqn_map[inv]
+                        continue
+                if isinstance(inv, Var):
+                    eqn_map[inv] = outv
+                new_invars.append(inv)
+                new_outvars.append(outv)
+            new_eqns.append(clone_jaxpr_eqn(eqn, new_invars, new_outvars))
+            continue
+        new_invars = [get_var_mapping(var_map, v) for v in eqn.invars]
+        new_eqns.append(clone_jaxpr_eqn(eqn, new_invars))
+    sliced_eqns = new_eqns[:mb_idx], [new_eqns[mb_idx]], new_eqns[mb_idx + 1:]
+    new_outvars = [
+        get_var_mapping(var_map, v) for v in closed_jaxpr.jaxpr.outvars
     ]
+    return clone_jaxpr(closed_jaxpr, outvars=new_outvars,
+                       eqns=new_eqns), sliced_eqns
 
 
 def jaxpr_have_apply_grad(closed_jaxpr: ClosedJaxpr):
@@ -320,6 +354,7 @@ def split_compute_grad_and_apply_grad(closed_jaxpr: ClosedJaxpr, gensym_fn,
     """Split the train_step jaxpr into two parts: compute_grad and
     apply_grad. These two parts are separated by a gradient marker generated
     by `alpa.grad`."""
+    # Locate the marker
     split_eqn = None
     for idx, eqn in enumerate(closed_jaxpr.eqns):
         if eqn.primitive is pipeline_p and eqn.params['mark_type'] == 'grad':
@@ -343,8 +378,12 @@ def split_compute_grad_and_apply_grad(closed_jaxpr: ClosedJaxpr, gensym_fn,
         closed_jaxpr.eqns[:split_idx], split_eqn,
         closed_jaxpr.eqns[split_idx + 1:]
     ]
-    closed_jaxpr, sliced_eqns = _rewrite_cross_layer_grad(
-        *sliced_eqns, gensym_fn, closed_jaxpr)
+    # Some equations are not marked. This pass moves them either into apply grad
+    # or a layer.
+    closed_jaxpr = _rewrite_cross_layer_grad(*sliced_eqns, gensym_fn,
+                                             closed_jaxpr)
+    closed_jaxpr, sliced_eqns = _remove_replicated_marked_var(closed_jaxpr)
+    # Reconstruct jaxpr
     sliced_jaxprs = slices_to_jaxpr(closed_jaxpr, sliced_eqns)
     compute_grad, _, apply_grad = sliced_jaxprs  # pylint: disable=unbalanced-tuple-unpacking
     split_eqn = sliced_eqns[1][0]
@@ -658,15 +697,19 @@ def _cross_mesh_allreduce_xla_translation(c, *args, **kwargs):
     input_params = args[0]
     input_shape = c.get_shape(input_params)
     op_type = _primitive_to_str[kwargs['type']]
+    opaque = op_type + b';' + mesh_ids_hash(kwargs['group_meshes'])
 
     # TODO(yonghao): the has_side_effect is to prevent CSE of the allreduce.
     # It might be replaced by adding its outvar to output
+    sharding = xc.OpSharding()
+    sharding.type = sharding.type.REPLICATED
+    c.set_sharding(sharding)
     output = xc.ops.CustomCall(c,
                                call_name,
                                operands=(input_params,),
                                shape=input_shape,
                                has_side_effect=True,
-                               opaque=op_type)
+                               opaque=opaque)
     c.clear_sharding()
     return output
 
@@ -850,24 +893,42 @@ class ApplyGradRewriter:
         self.eqn_mesh = {}
         self.var_use = {}
         self.var_def = {}
+        for eqn_idx, eqn in enumerate(self.eqns):
+            for invar in _filter_literal(eqn.invars):
+                self.var_use.setdefault(invar, OrderedSet()).add(eqn_idx)
+            for outvar in _filter_droped(eqn.outvars):
+                self.var_def[outvar] = eqn_idx
+        has_color = OrderedSet([
+            self.var_def[k]
+            for k in self.var_mesh
+            if (len(self.var_mesh[k]) > 0 and k in self.var_def)
+        ])
+        q = list(has_color)
+        while len(q) > 0:
+            for outv in _filter_droped(self.eqns[q[0]].outvars):
+                if outv not in self.var_use:
+                    continue
+                used_eqns = self.var_use[outv]
+                has_color.update(used_eqns)
+                for e_id in used_eqns.difference(has_color):
+                    q.append(e_id)
+            q = q[1:]
+
         # Propagate the first round
         for eqn_idx, eqn in enumerate(self.eqns):
             at_mesh = OrderedSet()
-            for invar in eqn.invars:
-                if isinstance(invar, Var):
-                    at_mesh.update(self.var_mesh.setdefault(
-                        invar, OrderedSet()))
-                    self.var_use.setdefault(invar, OrderedSet()).add(eqn_idx)
+            for invar in _filter_literal(eqn.invars):
+                at_mesh.update(self.var_mesh.setdefault(invar, OrderedSet()))
+            # TODO(yonghao): round robin this and use it in later positions
+            if len(at_mesh) == 0 and eqn_idx not in has_color:
+                at_mesh = OrderedSet([0])
             if len(at_mesh) == 1:
-                for invar in eqn.invars:
-                    if isinstance(invar, Var):
-                        self.var_mesh.setdefault(invar,
-                                                 OrderedSet()).update(at_mesh)
+                for invar in _filter_literal(eqn.invars):
+                    self.var_mesh.setdefault(invar,
+                                             OrderedSet()).update(at_mesh)
             self.eqn_mesh[eqn_idx] = list(at_mesh)
-            for outvar in eqn.outvars:
-                if not isinstance(outvar, DropVar):
-                    self.var_mesh[outvar] = OrderedSet(at_mesh)
-                    self.var_def[outvar] = eqn_idx
+            for outvar in _filter_droped(eqn.outvars):
+                self.var_mesh[outvar] = OrderedSet(at_mesh)
 
     def _reducable_chain_lookup(self, eqn_idx, num_mesh):
         """

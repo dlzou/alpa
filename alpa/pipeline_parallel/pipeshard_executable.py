@@ -30,7 +30,7 @@ from alpa.pipeline_parallel.runtime_emitter import (
     PipelineInstruction, PipeshardConfig)
 from alpa.shard_parallel.auto_sharding import HloStatus
 from alpa.timer import timers, tracer
-from alpa.util import OrderedSet
+from alpa.util import OrderedSet, mesh_ids_hash
 
 traceback_util.register_exclusion(__file__)
 
@@ -98,13 +98,14 @@ class PipeshardDriverExecutable:
         self.resharding_tasks = pipeshard_config.resharding_tasks
         for mesh_ids in pipeshard_config.allreduce_groups:
             meshes = [self.mesh_group.meshes[idx] for idx in mesh_ids]
-            create_and_record_cross_mesh_collective_communicators(meshes)
+            key = mesh_ids_hash(mesh_ids)
+            create_and_record_cross_mesh_collective_communicators(meshes, key)
         if global_config.eagerly_create_communicators:
             for task in self.resharding_tasks:
                 task.create_resharding_communicators()
 
         self.exec_uuid = next_mesh_executable_uuid()
-        # Create a PipeshardMeshWorkerExecuable for each MeshHostWorker
+        # Create a PipeshardMeshWorkerExecutable for each MeshHostWorker
         for mesh_idx, physical_mesh in enumerate(self.mesh_group):
             mesh_grad_uuids = pipeshard_config.grad_uuids[mesh_idx]
             for worker in physical_mesh.workers:
@@ -119,7 +120,7 @@ class PipeshardDriverExecutable:
                         pipeshard_config.reduced_var_uuid_lists[mesh_idx],
                         self.donate_invars[mesh_idx])
                 worker.put_executable.remote(self.exec_uuid,
-                                             PipeshardMeshWorkerExecuable,
+                                             PipeshardMeshWorkerExecutable,
                                              *args)
 
     ##### Compilation Related Functions #####
@@ -359,7 +360,10 @@ class PipeshardDriverExecutable:
         """
         os.makedirs(folder, exist_ok=True)
         name = self.stages[0].hlo.name
-        name = name[:name.index("pipeshard_parallel") - 1]
+        if "pipeshard_parallel" in name:
+            name = name[:name.index("pipeshard_parallel") - 1]
+        elif "create_state_parallel" in name:
+            name = name[:name.index("create_state_parallel") - 1]
         prefix = os.path.join(folder, name)
 
         fully_optimized_hlo_texts = self.get_hlo_text(HloStatus.FULLY_OPTIMIZED)
@@ -375,6 +379,11 @@ class PipeshardDriverExecutable:
         with open(f"{prefix}_resharding_tasks.txt", "w") as f:
             for task in self.resharding_tasks:
                 f.write(str(task) + "\n\n")
+
+        with open(f"{prefix}_input_placement_specs.txt", "w") as f:
+            f.write(str(self.get_input_placement_specs()))
+        with open(f"{prefix}_output_placement_specs.txt", "w") as f:
+            f.write(str(self.get_output_placement_specs()))
 
     def dump_stage_execution_trace(self, filename: str):
         exec_info = self.get_stage_execution_info()
@@ -425,7 +434,7 @@ class PipeshardDriverExecutable:
             mesh.delete_remote_executable(self.exec_uuid)
 
 
-class PipeshardMeshWorkerExecuable:
+class PipeshardMeshWorkerExecutable:
     """
     An executable that executes static pipeline runtime instructions on a
     worker.

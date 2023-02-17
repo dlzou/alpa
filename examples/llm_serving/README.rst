@@ -1,8 +1,8 @@
-===========================
-Serving OPT-175B using Alpa
-===========================
+=======================================================
+Serving OPT-175B, BLOOM-176B and CodeGen-16B using Alpa
+=======================================================
 
-This tutorial shows how to setup a serving system to serve the largest available pretrained language model `OPT-175B <https://github.com/facebookresearch/metaseq/tree/main/projects/OPT>`_.
+This tutorial shows how to setup a serving system to serve one of the largest available pretrained language models `OPT-175B <https://github.com/facebookresearch/metaseq/tree/main/projects/OPT>`_. The instructions for other models (BLOOM and CodeGen) are also listed at the end.
 
 👉 Try a live demo at `Alpa-OPT Demo <https://opt.alpa.ai>`_ 👈
 
@@ -223,11 +223,14 @@ Here are some tips for improving the generation speed.
    Alpa compiles multiple executables and uses these executables to encode a prompt chunk by chunk. This argument controls the possible chunk sizes. Depending on the length of your prompt, you can try different combinations. For example, if your prompt lengths are around 1000-1500, a good combination is ``[1, 256, 1024]``.
 3. Tune parallelization strategy. If you are familiar with alpa, you can tune the ``method`` argument of ``alpa.parallelize`` and try different parallelization methods.
 
-If you find the generation speed too slow and want to accelerate it, please join `Alpa slack <https://forms.gle/YEZTCrtZD6EAVNBQ7>`_ and tell us your use cases. We are acitvely working on improving the performance.
+If you find the generation speed too slow and want to accelerate it, please join `Alpa slack <https://forms.gle/YEZTCrtZD6EAVNBQ7>`_ and tell us your use cases. We are actively working on improving the performance.
 
+OPT License
+===========
+The use of the OPT pretrained weights is subject to the `Model License <https://github.com/facebookresearch/metaseq/blob/main/projects/OPT/MODEL_LICENSE.md>`_ by Metaseq.
 
-Other Models
-============
+Other Models (BLOOM)
+====================
 Alpa also supports `BLOOM <https://huggingface.co/bigscience/bloom>`_.
 You can use commands similar to OPT but with a different model name.
 
@@ -242,7 +245,15 @@ You can use commands similar to OPT but with a different model name.
     # Alpa backend
     python3 textgen.py --model alpa/bloom-560m
 
+Other Models (CodeGen)
+======================
+Alpa also supports `CodeGen <https://github.com/salesforce/CodeGen>`_.
+You can use commands similar to OPT but with a different model name.
 
-License
-=======
-The use of the OPT pretrained weights is subject to the `Model License <https://github.com/facebookresearch/metaseq/blob/main/projects/OPT/MODEL_LICENSE.md>`_ by Metaseq.
+  .. code:: shell
+
+    # Huggingface/pytorch backend
+    python3 codegen.py --model Salesforce/codegen-2B-mono
+
+    # Alpa backend
+    python3 codegen.py --model alpa/codegen-2B-mono

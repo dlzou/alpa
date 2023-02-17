@@ -6,7 +6,8 @@ Alpa can automatically parallelizes jax functions with both shard
 parallelism (a.k.a. intra-operator parallelism) and pipeline parallelism
 (a.k.a. inter-operator parallelism). Shard parallelism includes
 data parallelism, operator parallelism, and their combinations.
-The :ref:`quick start <Alpa Quickstart>` focuses on using Alpa for shard parallelism.
+The previous :ref:`quick start <alpa-quickstart>` tutorial focuses on
+using Alpa for shard parallelism.
 
 In this tutorial, we show how to use Alpa with both shard and pipeline parallelism.
 First, we show how to use Alpa to manually assign stages for pipeline parallelism.
@@ -164,7 +165,7 @@ def manual_pipeline_train_step(state, batch):
         loss = jnp.mean((out - batch["y"])**2)
         return loss
 
-    # We use `alpa.grad` here to seperate the apply gradient stage with the
+    # We use `alpa.grad` here to separate the apply gradient stage with the
     # forward/backward stages in the pipeline. This is necessary to ensure that
     # the gradient accumulation is correct.
     grads = alpa.grad(loss_func)(state.params)
@@ -227,7 +228,7 @@ def auto_pipeline_train_step(state, batch):
         loss = jnp.mean((out - batch["y"])**2)
         return loss
 
-    # Again, we use `alpa.grad` here to seperate the apply gradient stage with
+    # Again, we use `alpa.grad` here to separate the apply gradient stage with
     # the forward/backward stages in the pipeline.
     grads = alpa.grad(loss_func)(state.params)
     new_state = state.apply_gradients(grads=grads)
