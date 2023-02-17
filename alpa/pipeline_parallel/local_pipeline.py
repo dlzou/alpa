@@ -323,9 +323,6 @@ class LocalPipelineExecutable:
         var_reference_count = {}
         swap_log = []
         
-        print(self.global_invars)
-        print(self.global_outvars)
-
         # Create variable dependency mapping.
         for stage in self.stages:
             for var in stage.invars:
@@ -425,7 +422,7 @@ class LocalPipelineExecutable:
                     sender_runner.del_var(var)
 
         # Examine swap patterns.
-        print(view_swap_log(swap_log))
+        # print(view_swap_log(swap_log))
 
         return global_outvals_list
 
